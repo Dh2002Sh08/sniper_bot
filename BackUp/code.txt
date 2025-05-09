@@ -1,0 +1,187 @@
+const {
+  Connection,
+  Keypair,
+  Transaction,
+  VersionedTransaction,
+  PublicKey,
+  sendAndConfirmTransaction,
+} = require('@solana/web3.js');
+const {
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountInstruction,
+  getAccount,
+  TOKEN_PROGRAM_ID,
+  NATIVE_MINT,
+} = require('@solana/spl-token');
+const axios = require('axios');
+const { API_URLS } = require('@raydium-io/raydium-sdk-v2');
+const fs = require('fs');
+const path = require('path');
+const bs58 = require('bs58');
+
+const RPC_URL = 'https://api.devnet.solana.com';
+const connection = new Connection(RPC_URL, 'confirmed');
+
+async function buyToken(outputMint) {
+  const amount = 10000000;
+  const inputMint = NATIVE_MINT.toBase58();
+  const slippage = 1;
+  const txVersion = 'V0';
+  const isInputSol = true;
+  const isOutputSol = false;
+  const isV0Tx = true;
+
+  try {
+    const walletFilePath = path.resolve(process.cwd(), '../../wallet.json');
+    if (!fs.existsSync(walletFilePath)) {
+      throw new Error(`Wallet file not found at ${walletFilePath}`);
+    }
+
+    let selected;
+    try {
+      selected = JSON.parse(fs.readFileSync(walletFilePath, 'utf-8'));
+    } catch (err) {
+      throw new Error(`Failed to parse wallet.json: ${err.message}`);
+    }
+
+    let secretKey;
+    if (Array.isArray(selected)) {
+      if (selected.length !== 64) throw new Error('Invalid secretKey length');
+      secretKey = Uint8Array.from(selected);
+    } else if (selected?.secretKey) {
+      if (Array.isArray(selected.secretKey)) {
+        if (selected.secretKey.length !== 64) throw new Error('Invalid secretKey length');
+        secretKey = Uint8Array.from(selected.secretKey);
+      } else if (typeof selected.secretKey === 'string') {
+        secretKey = bs58.decode(selected.secretKey);
+        if (secretKey.length !== 64) throw new Error('Base58 secretKey has invalid length');
+      } else {
+        throw new Error('Invalid secretKey format');
+      }
+    } else {
+      throw new Error('wallet.json must contain secretKey');
+    }
+
+    const owner = Keypair.fromSecretKey(secretKey);
+    const inputMintPk = new PublicKey(inputMint);
+    const outputMintPk = new PublicKey(outputMint);
+
+    const inputTokenAcc = isInputSol ? null : await getAssociatedTokenAddress(inputMintPk, owner.publicKey);
+    const outputTokenAcc = isOutputSol ? null : await getAssociatedTokenAddress(outputMintPk, owner.publicKey);
+
+    const ataInstructions = [];
+
+    if (!isOutputSol && outputTokenAcc) {
+      try {
+        await getAccount(connection, outputTokenAcc);
+      } catch {
+        ataInstructions.push(
+          createAssociatedTokenAccountInstruction(
+            owner.publicKey,
+            outputTokenAcc,
+            owner.publicKey,
+            outputMintPk,
+            TOKEN_PROGRAM_ID
+          )
+        );
+      }
+    }
+
+    if (!isInputSol && inputTokenAcc) {
+      try {
+        await getAccount(connection, inputTokenAcc);
+      } catch {
+        ataInstructions.push(
+          createAssociatedTokenAccountInstruction(
+            owner.publicKey,
+            inputTokenAcc,
+            owner.publicKey,
+            inputMintPk,
+            TOKEN_PROGRAM_ID
+          )
+        );
+      }
+    }
+
+    if (ataInstructions.length > 0) {
+      const ataTx = new Transaction().add(...ataInstructions);
+      ataTx.feePayer = owner.publicKey;
+      const { blockhash } = await connection.getLatestBlockhash();
+      ataTx.recentBlockhash = blockhash;
+      ataTx.sign(owner);
+      const ataSig = await connection.sendRawTransaction(ataTx.serialize(), { skipPreflight: true });
+
+      let confirmed = false, attempts = 0;
+      const maxAttempts = 3;
+      while (!confirmed && attempts < maxAttempts) {
+        attempts++;
+        try {
+          const { lastValidBlockHeight } = await connection.getLatestBlockhash();
+          await connection.confirmTransaction({ signature: ataSig, blockhash, lastValidBlockHeight }, 'confirmed');
+          confirmed = true;
+        } catch (err) {
+          if (attempts === maxAttempts) {
+            throw new Error(`Failed to confirm ATA transaction: ${err.message}`);
+          }
+        }
+      }
+    }
+
+    const { data: priorityFeeData } = await axios.get(`${API_URLS.BASE_HOST}${API_URLS.PRIORITY_FEE}`);
+    const priorityFee = priorityFeeData?.data?.default?.h;
+    if (!priorityFee) throw new Error('Failed to fetch priority fee');
+
+    const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippage * 100}&txVersion=${txVersion}`;
+    const { data: swapResponse } = await axios.get(swapQuoteUrl);
+    if (!swapResponse || !swapResponse.success) {
+      throw new Error(`Swap quote failed: ${swapResponse?.msg || 'Unknown error'}`);
+    }
+
+    const { data: swapTxData } = await axios.post(`${API_URLS.SWAP_HOST}/transaction/swap-base-in`, {
+      computeUnitPriceMicroLamports: String(priorityFee),
+      swapResponse,
+      txVersion,
+      wallet: owner.publicKey.toBase58(),
+      wrapSol: isInputSol,
+      unwrapSol: isOutputSol,
+      inputAccount: isInputSol ? undefined : inputTokenAcc?.toBase58(),
+      outputAccount: isOutputSol ? undefined : outputTokenAcc?.toBase58(),
+    });
+
+    if (!swapTxData.success || !Array.isArray(swapTxData.data)) {
+      throw new Error(`Swap transaction request failed: ${swapTxData.msg || 'Invalid data'}`);
+    }
+
+    const transactions = swapTxData.data.map((tx) => {
+      if (!tx.transaction) throw new Error('Missing transaction data');
+      const buf = Buffer.from(tx.transaction, 'base64');
+      return isV0Tx ? VersionedTransaction.deserialize(buf) : Transaction.from(buf);
+    });
+
+    for (let i = 0; i < transactions.length; i++) {
+      const tx = transactions[i];
+      if (isV0Tx) {
+        tx.sign([owner]);
+        const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 5 });
+        console.log(`V0 Tx ${i + 1} sent: ${txid}`);
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+        await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature: txid }, 'confirmed');
+        console.log(`V0 Tx ${i + 1} confirmed`);
+      } else {
+        tx.sign(owner);
+        const txid = await sendAndConfirmTransaction(connection, tx, [owner], {
+          skipPreflight: true,
+          commitment: 'confirmed',
+        });
+        console.log(`Tx ${i + 1} confirmed: ${txid}`);
+      }
+    }
+
+    console.log('🎉 Token purchase completed successfully');
+  } catch (err) {
+    console.error('Buy error:', err.message || err);
+    throw err;
+  }
+}
+
+buyToken('A8fDCGHFCf2EtHBxbjxWcZFtxDxpwcdV92gvRUCURJqH');

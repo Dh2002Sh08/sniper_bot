@@ -5,7 +5,7 @@ const API_KEY = process.env.NEXT_PUBLIC_SHYFT_KEY;
 // console.log("API_KEY", API_KEY);
 
 const RAYDIUM_PROGRAM_ID = new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
-const connection = new Connection(`https://rpc.shyft.to?api_key=${API_KEY}`, { commitment: "confirmed" });
+export const connection = new Connection(`https://rpc.shyft.to?api_key=${API_KEY}`, { commitment: "confirmed" });
 
 const tokenList = []; // ⏳ Temporary in-memory store
 
@@ -92,4 +92,3 @@ function formatAge(createdAtMs) {
 
   return result.trim();
 }
-

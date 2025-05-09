@@ -23,6 +23,9 @@ export default function Navbar() {
             <Link href="/pumpfunData" className="hover:text-yellow-400">
               Pumpfun Data
             </Link>
+            <Link href="/bot" className="hover:text-yellow-400">
+              BOT
+            </Link>
           </div>
 
           {/* Mobile menu button */}
